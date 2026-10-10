@@ -165,7 +165,13 @@ func (a *App) Daemon(ctx context.Context) error {
 			continue
 		}
 
-		a.logger.Printf("检测到%s (HTTP %d)，开始认证 ...", res.State, res.Code)
+		if res.State == netprobe.Unknown {
+			// 最常见的场景：刚开机，DNS 还没就绪，探测域名全部解析失败。
+			// 这时不能干等 —— 认证请求直连网关 IP，不依赖 DNS，先试了再说。
+			a.logger.Printf("探测不到联网状态（%v），直接尝试认证 ...", res.Err)
+		} else {
+			a.logger.Printf("检测到%s (HTTP %d)，开始认证 ...", res.State, res.Code)
+		}
 
 		r, err := a.LoginOnce(ctx, &res)
 		switch {

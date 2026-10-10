@@ -107,22 +107,20 @@ func Check(urls []string, timeout time.Duration) Result {
 			return Result{State: Offline, Location: loc, Code: resp.StatusCode}
 		}
 	}
-	// 兜底：直接请求网关本身，能通就说明至少局域网是活的
-	if r := probeGatewayBare(); r != nil {
-		return *r
-	}
+	// 所有探测地址都不可用。
+	//
+	// ⚠️ 这里【绝不能】因为「TCP 能连上」就判定为 Online。
+	// 未认证时网关根本不封 TCP —— 任何公网 IP 的 80 端口都连得上，
+	// 「能连通」完全不能证明「已认证」。
+	//
+	// 实测教训：开机后 DNS 往往还没就绪，三个探测域名全部解析失败，
+	// 旧代码据此兜底返回 Online（表现为日志里的 `在线 (HTTP 0)`），
+	// 守护以为不需要认证便一直不干活 —— 用户开机能等到天荒地老也连不上网，
+	// 最后只能手动去认证页登录。
+	//
+	// 返回 Unknown 才是对的：交给上层去尝试认证。认证请求是直连网关 IP 的
+	// （172.16.8.22:801），根本不经过 DNS，恰恰是这种情况下的正确动作。
 	return Result{State: Unknown, Err: lastErr}
-}
-
-// probeGatewayBare 在标准探测地址都不可用时，退一步只判断「局域网是否可达」。
-// 返回 nil 表示无法判断。
-func probeGatewayBare() *Result {
-	conn, err := net.DialTimeout("tcp", "223.5.5.5:80", 3*time.Second)
-	if err == nil {
-		conn.Close()
-		return &Result{State: Online}
-	}
-	return nil
 }
 
 // LocalIPTowards 问内核：要访问 host:port 时应该用哪个本机地址作为源地址。
