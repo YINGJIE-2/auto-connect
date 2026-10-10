@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/YINGJIE-2/auto-connect/internal/config"
@@ -126,17 +127,25 @@ func (a *App) LoginOnce(ctx context.Context, probe *netprobe.Result) (portal.Res
 
 // verifyOnline 登录成功后复检。
 //
-// 两个要点，都是实测踩出来的：
+// 三个要点，都是实测踩出来的：
 //  1. **必须重试** —— 网关放行有 1~2 秒延迟，认证一返回成功就立刻探测会误报「未联网」。
-//  2. **每次探测必须用短超时**。用默认的 8 秒，网关放行期间第一个地址一旦卡住
-//     就要白等 8 秒，日志上表现为「开始认证 → 认证成功」隔了 10~11 秒，
-//     用户会觉得连得很慢。改成 1.5 秒后，正常情况下 2~3 秒就能确认。
+//  2. **每次探测必须用短超时**。用默认的 8 秒，一旦某个地址卡住就要白等 8 秒，
+//     日志上表现为「开始认证 → 认证成功」隔了 10~11 秒，用户会觉得连得很慢。
+//  3. **不要先 sleep 再探**。第一轮立刻探，赶上网关已经放行的情况就能秒返回；
+//     没赶上再退到 300ms 间隔重试，反正探测本身被短超时兜着，不会空转。
+//
+// 另外 netprobe.Check 是并行探测的，单次耗时被封顶在 timeout，
+// 不会随探测地址数量线性增长（串行版本 3 个地址最坏要 3 x timeout）。
 func (a *App) verifyOnline() bool {
-	for i := 0; i < 8; i++ {
-		time.Sleep(800 * time.Millisecond)
+	deadline := time.Now().Add(15 * time.Second)
+	for time.Now().Before(deadline) {
 		if netprobe.Check(a.cfg.ProbeURLs, 1500*time.Millisecond).State == netprobe.Online {
 			return true
 		}
+		if time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(300 * time.Millisecond)
 	}
 	return false
 }
@@ -160,7 +169,7 @@ func (a *App) Daemon(ctx context.Context) error {
 				a.logger.Printf("已恢复在线（此前连续失败 %d 次）", failStreak)
 			}
 			failStreak = 0
-			a.logger.Printf("在线 (HTTP %d)", res.Code)
+			a.logger.Printf("在线 (HTTP %d，%s)", res.Code, probeHost(res.URL))
 			if !sleepCtx(ctx, time.Duration(b.CheckInterval)*time.Second) {
 				return nil
 			}
@@ -172,18 +181,21 @@ func (a *App) Daemon(ctx context.Context) error {
 			// 这时不能干等 —— 认证请求直连网关 IP，不依赖 DNS，先试了再说。
 			a.logger.Printf("探测不到联网状态（%v），直接尝试认证 ...", res.Err)
 		} else {
-			a.logger.Printf("检测到%s (HTTP %d)，开始认证 ...", res.State, res.Code)
+			a.logger.Printf("检测到%s (HTTP %d，%s)，开始认证 ...",
+				res.State, res.Code, probeHost(res.URL))
 		}
 
 		t0 := time.Now()
 		r, err := a.LoginOnce(ctx, &res)
+		loginCost := time.Since(t0)
 		switch {
 		case err != nil:
-			a.logger.Printf("认证异常（用时 %.1f 秒）：%v", time.Since(t0).Seconds(), err)
+			a.logger.Printf("认证异常（用时 %.1f 秒）：%v", loginCost.Seconds(), err)
 		case r.OK:
+			t1 := time.Now()
 			if a.verifyOnline() {
-				a.logger.Printf("认证成功，网络已恢复（账号 %s，全程 %.1f 秒）",
-					a.cfg.Account(), time.Since(t0).Seconds())
+				a.logger.Printf("认证成功，网络已恢复（账号 %s，认证 %.1f 秒 + 复检 %.1f 秒）",
+					a.cfg.Account(), loginCost.Seconds(), time.Since(t1).Seconds())
 				failStreak = 0
 				if !sleepCtx(ctx, time.Duration(b.CheckInterval)*time.Second) {
 					return nil
@@ -239,6 +251,18 @@ func truncate(s string, n int) string {
 		return s
 	}
 	return s[:n] + "..."
+}
+
+// probeHost 把探测地址压成主机名，让日志短一点。
+func probeHost(u string) string {
+	s := strings.TrimPrefix(strings.TrimPrefix(u, "http://"), "https://")
+	if i := strings.IndexByte(s, '/'); i >= 0 {
+		s = s[:i]
+	}
+	if s == "" {
+		return "?"
+	}
+	return s
 }
 
 func orDefault(s, d string) string {

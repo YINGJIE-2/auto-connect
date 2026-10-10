@@ -8,6 +8,7 @@ package netprobe
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net"
 	"net/http"
@@ -46,6 +47,11 @@ type Result struct {
 	Location string // Offline 时的 302 目标地址
 	Code     int
 	Err      error
+	// URL 是给出结论的那个探测地址。
+	// 并行探测下「谁先答谁算」，几个源返回的状态码并不一样
+	// （小米 generate_204 在线时是 204，苹果 hotspot-detect 是 200 + "Success"），
+	// 记下来才不会让日志看起来自相矛盾。
+	URL string
 }
 
 const (
@@ -61,50 +67,50 @@ var httpClient = &http.Client{
 	},
 }
 
-// Check 依次尝试各探测地址，返回第一个能得出结论的结果。
+// Check 并行请求所有探测地址，返回第一个能得出结论的结果。
 // 只有「所有地址都请求失败」时才返回 Unknown。
+//
+// 为什么必须并行：timeout 是**整轮探测的总预算**，不是每个地址各自的。
+// 串行版本（旧实现）会把超时乘上地址数量 —— 传 1.5 秒、3 个地址，
+// 一次探测最坏要 4.5 秒；复检要试好几轮，用户就会看到「认证成功」前面
+// 挂了 10 秒。并行之后单次探测被 ctx 统一封顶，不管几个地址都是一个 timeout。
 func Check(urls []string, timeout time.Duration) Result {
 	if timeout <= 0 {
 		timeout = defaultTimeout
 	}
-	var lastErr error
+	if len(urls) == 0 {
+		return Result{State: Unknown, Err: errors.New("未配置探测地址")}
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	// 结果通道要留够缓冲，否则 ctx 超时后没被取走的 goroutine 会永远阻塞。
+	type outcome struct {
+		res Result
+		err error
+	}
+	ch := make(chan outcome, len(urls))
 	for _, u := range urls {
-		ctx, cancel := context.WithTimeout(context.Background(), timeout)
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
-		if err != nil {
-			cancel()
-			lastErr = err
-			continue
-		}
-		req.Header.Set("User-Agent", defaultUA)
-		req.Header.Set("Cache-Control", "no-cache")
+		go func(u string) {
+			res, err := probeOne(ctx, u)
+			ch <- outcome{res: res, err: err}
+		}(u)
+	}
 
-		resp, err := httpClient.Do(req)
-		if err != nil {
-			cancel()
-			lastErr = err
-			continue
-		}
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		resp.Body.Close()
-		loc := resp.Header.Get("Location")
-		cancel()
-
-		switch {
-		case resp.StatusCode == http.StatusNoContent:
-			return Result{State: Online, Code: resp.StatusCode}
-		case strings.Contains(string(body), "Microsoft Connect Test"):
-			return Result{State: Online, Code: resp.StatusCode}
-		case strings.Contains(string(body), "Success"):
-			return Result{State: Online, Code: resp.StatusCode}
-		case resp.StatusCode >= 300 && resp.StatusCode < 400:
-			return Result{State: Offline, Location: loc, Code: resp.StatusCode}
-		case resp.StatusCode == http.StatusOK:
-			// 200 但内容不符合预期 —— 典型是被网关塞了一个提示页
-			return Result{State: Offline, Location: loc, Code: resp.StatusCode}
-		default:
-			lastErr = nil
-			return Result{State: Offline, Location: loc, Code: resp.StatusCode}
+	var lastErr error
+	for range urls {
+		select {
+		case o := <-ch:
+			if o.err == nil {
+				return o.res // 有结论，立刻返回，不等其余地址
+			}
+			lastErr = o.err
+		case <-ctx.Done():
+			if lastErr == nil {
+				lastErr = ctx.Err()
+			}
+			return Result{State: Unknown, Err: lastErr}
 		}
 	}
 	// 所有探测地址都不可用。
@@ -121,6 +127,40 @@ func Check(urls []string, timeout time.Duration) Result {
 	// 返回 Unknown 才是对的：交给上层去尝试认证。认证请求是直连网关 IP 的
 	// （172.16.8.22:801），根本不经过 DNS，恰恰是这种情况下的正确动作。
 	return Result{State: Unknown, Err: lastErr}
+}
+
+// probeOne 请求单个探测地址。
+//
+// 返回 (结果, nil) 表示这个地址给出了明确结论；
+// 返回 (零值, err) 表示请求本身失败（DNS 解析不了、连不上、超时），
+// 上层应该换别的地址继续试。
+func probeOne(ctx context.Context, u string) (Result, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	if err != nil {
+		return Result{}, err
+	}
+	req.Header.Set("User-Agent", defaultUA)
+	req.Header.Set("Cache-Control", "no-cache")
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return Result{}, err
+	}
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+	resp.Body.Close()
+
+	res := Result{URL: u, Location: resp.Header.Get("Location"), Code: resp.StatusCode}
+	switch {
+	case resp.StatusCode == http.StatusNoContent:
+		res.State = Online
+	case strings.Contains(string(body), "Microsoft Connect Test"),
+		strings.Contains(string(body), "Success"):
+		res.State = Online
+	default:
+		// 3xx 跳转、200 但塞了提示页、以及其他状态码 —— 都说明被网关拦住了
+		res.State = Offline
+	}
+	return res, nil
 }
 
 // LocalIPTowards 问内核：要访问 host:port 时应该用哪个本机地址作为源地址。
