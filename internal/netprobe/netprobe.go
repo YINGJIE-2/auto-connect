@@ -144,13 +144,13 @@ func LocalIPTowards(host string, port int) string {
 
 // RedirectParams 是从 302 Location 里解析出来的可用信息。
 type RedirectParams struct {
-	UserIP  string
-	ACName  string
-	ACIP    string
-	ACMAC   string
-	Host    string // 网关主机
-	Port    int    // 若 Location 带了端口则用它的
-	Raw     string
+	UserIP string
+	ACName string
+	ACIP   string
+	ACMAC  string
+	Host   string // 网关主机
+	Port   int    // 若 Location 带了端口则用它的
+	Raw    string
 }
 
 // ParseRedirect 从重定向地址中提取参数。

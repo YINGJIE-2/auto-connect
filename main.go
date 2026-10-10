@@ -2,7 +2,7 @@
 //
 // 用法：
 //
-//	auto-connect            首次运行进入配置向导；已配置则启动守护
+//	auto-connect            打开操作菜单（双击本程序就是这个）
 //	auto-connect setup      重新配置
 //	auto-connect daemon     常驻守护（掉线自动重连）
 //	auto-connect status     查看当前联网状态
@@ -14,6 +14,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"flag"
 	"fmt"
@@ -21,9 +22,11 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/YINGJIE-2/auto-connect/internal/app"
 	"github.com/YINGJIE-2/auto-connect/internal/autostart"
@@ -31,6 +34,9 @@ import (
 	"github.com/YINGJIE-2/auto-connect/internal/netprobe"
 	"github.com/YINGJIE-2/auto-connect/internal/win"
 )
+
+// daemonMutex 是守护进程的单实例名。菜单靠它判断「后台守护是否在跑」。
+const daemonMutex = "auto-connect-daemon"
 
 const version = "0.1.0"
 
@@ -82,11 +88,8 @@ func run() error {
 		usage()
 		return nil
 	case "":
-		// 无参数：没配置就走向导，配好了就常驻守护
-		if !config.Exists() {
-			return cmdSetup(nil)
-		}
-		return cmdDaemon(args)
+		// 无参数（双击 exe）：打开操作菜单
+		return cmdMenu()
 	default:
 		usage()
 		return fmt.Errorf("未知命令：%s", cmd)
@@ -97,8 +100,8 @@ func usage() {
 	fmt.Print(banner)
 	fmt.Print(`
 命令：
-  setup       首次配置（填学号、密码、选运营商）
-  daemon      常驻后台，掉线自动重连
+  setup       重新配置（填学号、密码、选运营商）
+  daemon      当前窗口里常驻守护（关掉窗口就停）
   status      查看当前联网状态
   login       立刻认证一次
   install     注册开机自启
@@ -106,10 +109,273 @@ func usage() {
   log         显示日志文件路径
   version     显示版本
 
-配置完成后，直接双击本程序即可开始守护。
-文件位置：`)
+直接双击程序 = 打开操作菜单，所有功能都在里面。
+配置文件位置：`)
 	p, _ := config.Path()
 	fmt.Println("  " + p)
+}
+
+// ---------------------------------------------------------------- 操作菜单
+
+// cmdMenu 是双击程序后的主界面。
+//
+// 设计取舍：这个窗口只是一个「遥控器」。
+// 真正的守护是菜单启动的独立后台进程，所以**用户随时可以关掉这个窗口**，
+// 不会像以前那样一关窗口就断掉守护。
+func cmdMenu() error {
+	fmt.Print("\n" + banner)
+	fmt.Println("  本窗口只是操作面板，随时可以关闭；后台守护是独立进程，不受影响。")
+
+	if !config.Exists() {
+		fmt.Println("\n还没配置过，先带你配一遍（大约 30 秒）。")
+		if err := cmdSetup(nil); err != nil {
+			return err
+		}
+	}
+
+	for {
+		cfg, err := config.Load()
+		if err != nil {
+			return fmt.Errorf("读取配置失败: %w", err)
+		}
+		running := daemonRunning()
+		auto := autostart.IsInstalled()
+
+		fmt.Println("\n===========================================================")
+		fmt.Printf("  账号     : %s（%s）\n", cfg.Account(), config.ISPName(cfg.ISP))
+		fmt.Printf("  当前状态 : %s\n", stateText(cfg))
+		fmt.Printf("  后台守护 : %s\n", boolText(running, "运行中", "未运行"))
+		fmt.Printf("  开机自启 : %s\n", boolText(auto, "已开启", "未开启"))
+		fmt.Println("-----------------------------------------------------------")
+		fmt.Println("  1) 立即检测并重连")
+		fmt.Println("  2) 修改配置（学号 / 密码 / 运营商）")
+		fmt.Println("  3) 启动后台守护（关掉本窗口也会继续跑）")
+		fmt.Println("  4) 停止后台守护")
+		fmt.Println("  5) 开机自启  开启 / 关闭")
+		fmt.Println("  6) 查看日志")
+		fmt.Println("  0) 退出")
+		fmt.Println("-----------------------------------------------------------")
+
+		// 一句话告诉用户「现在到底还要不要做点什么」
+		switch {
+		case running && auto:
+			fmt.Println("  提示：已全部就绪，以后开机不用管它。")
+		case running && !auto:
+			fmt.Println("  提示：守护在跑，但没开开机自启。选 5 开启后，重启就不用手动来了。")
+		case !running && auto:
+			fmt.Println("  提示：开机自启已开，重启后会自动生效；想立刻生效就选 3。")
+		default:
+			fmt.Println("  提示：目前没有任何守护在跑。选 3 启动后台守护，选 5 让它开机自动来。")
+		}
+
+		choice := strings.TrimSpace(readLineInput("\n请选择"))
+		switch choice {
+		case "1":
+			menuReconnect(cfg)
+		case "2":
+			if err := cmdSetup(nil); err != nil {
+				fmt.Println("\n配置未完成：" + err.Error())
+			}
+		case "3":
+			menuStartDaemon()
+		case "4":
+			menuStopDaemon()
+		case "5":
+			menuToggleAutostart()
+		case "6":
+			menuShowLog()
+		case "0", "q", "Q":
+			fmt.Println("\n再见。")
+			return nil
+		default:
+			fmt.Println("\n请输入 0 ~ 6 之间的数字。")
+		}
+	}
+}
+
+// stateText 做一次实时探测。
+// 超时特意设短（4 秒/地址）：菜单是要反复刷新的，在线时它 0.2 秒就返回，
+// 离线时也不能让界面卡上二十几秒。
+func stateText(cfg *config.Config) string {
+	res := netprobe.Check(cfg.ProbeURLs, 4*time.Second)
+	switch res.State {
+	case netprobe.Online:
+		return "已联网"
+	case netprobe.Offline:
+		return "需要认证（现在上不了外网）"
+	default:
+		return "无法判断（网线没插或网卡没启用？）"
+	}
+}
+
+func menuReconnect(cfg *config.Config) {
+	pw, err := loadCredential()
+	if err != nil {
+		fmt.Println("\n读取密码失败：" + err.Error())
+		fmt.Println("请先用菜单 2) 重新配置一次。")
+		return
+	}
+	a := app.New(cfg, pw, newLogger(false))
+
+	res := a.Check()
+	if res.State == netprobe.Online {
+		fmt.Println("\n当前已经联网了，不用认证。")
+		return
+	}
+
+	fmt.Printf("\n检测到%s，正在认证 ...\n", res.State)
+	r, err := a.LoginOnce(context.Background(), &res)
+	if err != nil {
+		fmt.Println("认证异常：" + err.Error())
+		return
+	}
+	if r.OK {
+		fmt.Println("认证成功，账号 " + cfg.Account())
+		return
+	}
+	fmt.Printf("认证失败：%s\n", r.Message)
+	fmt.Println("常见原因是密码不对或运营商选错。可以用菜单 2) 改一下。")
+}
+
+func menuStartDaemon() {
+	if daemonRunning() {
+		fmt.Println("\n后台守护已经在跑了，不用重复启动。")
+		return
+	}
+
+	exe, err := os.Executable()
+	if err != nil {
+		fmt.Println("\n无法定位程序路径：" + err.Error())
+		return
+	}
+	// 清掉可能残留的停止标记，否则新守护会立刻自杀
+	_ = os.Remove(stopFlagPath())
+
+	if err := win.LaunchDetached(exe, "daemon", "--hidden"); err != nil {
+		fmt.Println("\n启动失败：" + err.Error())
+		return
+	}
+
+	// 给它 1 秒起来，然后确认一下，避免「看起来成功其实没起来」
+	time.Sleep(time.Second)
+	if !daemonRunning() {
+		fmt.Println("\n启动似乎没有成功，请稍后重试，或改用菜单外的命令行：auto-connect daemon")
+		return
+	}
+	fmt.Println("\n已启动后台守护：掉线会自动重连，关掉本窗口也不受影响。")
+	fmt.Println("日志文件：" + logPathOrEmpty())
+}
+
+func menuStopDaemon() {
+	if !daemonRunning() {
+		fmt.Println("\n后台守护当前没有在运行。")
+		return
+	}
+	if err := os.WriteFile(stopFlagPath(), []byte("stop"), 0o600); err != nil {
+		fmt.Println("\n发送停止指令失败：" + err.Error())
+		return
+	}
+	fmt.Print("\n已发送停止指令，正在等待它退出 ...")
+	for i := 0; i < 20; i++ { // 最多等 10 秒
+		time.Sleep(500 * time.Millisecond)
+		if !daemonRunning() {
+			fmt.Println(" 已停止。")
+			return
+		}
+	}
+	fmt.Println()
+	fmt.Println("它还在运行（可能正卡在联网探测的超时等待里）。再等几秒重试，")
+	fmt.Println("或打开任务管理器结束 auto-connect.exe。")
+}
+
+func menuToggleAutostart() {
+	if autostart.IsInstalled() {
+		if err := autostart.Uninstall(); err != nil {
+			fmt.Println("\n关闭开机自启失败：" + err.Error())
+			return
+		}
+		fmt.Println("\n已关闭开机自启。以后开机需要自己双击本程序。")
+		return
+	}
+	if err := autostart.Install(""); err != nil {
+		fmt.Println("\n开启开机自启失败：" + err.Error())
+		fmt.Println("建议把程序放到固定的目录（例如 D:\\Tools\\auto-connect\\）再试一次，")
+		fmt.Println("放在桌面或下载文件夹里，路径变动后自启会失效。")
+		return
+	}
+	fmt.Println("\n已开启开机自启：开机会延迟 30 秒、等网络就绪后自动联网，不弹窗口。")
+}
+
+func menuShowLog() {
+	p, err := config.LogPath()
+	if err != nil {
+		fmt.Println("\n" + err.Error())
+		return
+	}
+	data, err := os.ReadFile(p)
+	if err != nil || len(data) == 0 {
+		fmt.Println("\n还没有日志。日志要等守护跑起来之后才会产生。")
+		fmt.Println("日志文件：" + p)
+		return
+	}
+	lines := strings.Split(strings.TrimRight(string(data), "\r\n"), "\n")
+	const tail = 20
+	if len(lines) > tail {
+		lines = lines[len(lines)-tail:]
+	}
+	fmt.Printf("\n------- 最近 %d 行日志 -------\n", len(lines))
+	for _, l := range lines {
+		fmt.Println("  " + strings.TrimRight(l, "\r"))
+	}
+	fmt.Println("-------------------------------------")
+	fmt.Println("完整日志：" + p)
+}
+
+// daemonRunning 判断后台守护是否在运行。
+// 原理：守护进程持有一个命名互斥体；能抢到锁说明没人在跑。
+func daemonRunning() bool {
+	release, ok, err := win.SingleInstance(daemonMutex)
+	if err != nil {
+		return false
+	}
+	if !ok {
+		return true // 抢不到 = 已经有守护在跑
+	}
+	release()
+	return false
+}
+
+// stopFlagPath 返回停止标记文件路径。守护每轮探测都会看它一眼。
+func stopFlagPath() string {
+	dir, err := config.Dir()
+	if err != nil {
+		return "auto-connect.stop"
+	}
+	return filepath.Join(dir, "stop.flag")
+}
+
+func readLineInput(label string) string {
+	fmt.Print(label + " > ")
+	line, err := bufio.NewReader(os.Stdin).ReadString('\n')
+	if err != nil && line == "" {
+		return ""
+	}
+	return strings.TrimSpace(line)
+}
+
+func boolText(b bool, yes, no string) string {
+	if b {
+		return yes
+	}
+	return no
+}
+
+func logPathOrEmpty() string {
+	p, err := config.LogPath()
+	if err != nil {
+		return "(不可用)"
+	}
+	return p
 }
 
 // ---------------------------------------------------------------- 配置向导
@@ -340,7 +606,7 @@ func cmdDaemon(args []string) error {
 		win.HideConsole()
 	}
 
-	release, ok, err := win.SingleInstance("auto-connect-daemon")
+	release, ok, err := win.SingleInstance(daemonMutex)
 	if err != nil {
 		return err
 	}
@@ -359,8 +625,33 @@ func cmdDaemon(args []string) error {
 		return err
 	}
 
+	// 清掉上次可能遗留的停止标记，否则刚起来就会立刻退出
+	flagPath := stopFlagPath()
+	_ = os.Remove(flagPath)
+
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+
+	// 监听「停止标记文件」。
+	// 菜单里的「停止后台守护」就是写这个文件 —— 用文件而不是杀进程，
+	// 既避开权限问题，也让守护能在安全点优雅退出而不是被强杀。
+	go func() {
+		t := time.NewTicker(2 * time.Second)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				if _, err := os.Stat(flagPath); err == nil {
+					_ = os.Remove(flagPath)
+					fmt.Println("收到停止指令，守护结束")
+					stop()
+					return
+				}
+			}
+		}
+	}()
 
 	a := app.New(cfg, pw, newLogger(!*hidden))
 	return a.Daemon(ctx)

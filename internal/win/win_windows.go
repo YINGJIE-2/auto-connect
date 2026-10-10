@@ -162,4 +162,3 @@ func readLine() (string, error) {
 func HideConsole() {
 	procFreeConsole.Call()
 }
-
