@@ -1,0 +1,33 @@
+{
+  "username": "你的学号",
+  "isp": "campus",
+
+  "portal": {
+    "type": "auto",
+    "host": "",
+    "port": 801,
+    "login_method": 1,
+    "js_version": "3.3.3",
+    "account_prefix": "",
+    "isp_suffix": {
+      "telecom": "@telecom",
+      "cmcc": "@cmcc",
+      "unicom": "@unicom",
+      "campus": ""
+    }
+  },
+
+  "behavior": {
+    "check_interval": 30,
+    "reconnect_delay": 5,
+    "backoff_max": 60,
+    "max_fail_before_slow": 5,
+    "slow_interval": 300
+  },
+
+  "probe_urls": [
+    "http://connect.rom.miui.com/generate_204",
+    "http://www.msftconnecttest.com/connecttest.txt",
+    "http://captive.apple.com/hotspot-detect.html"
+  ]
+}

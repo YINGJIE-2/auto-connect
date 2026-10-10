@@ -1,0 +1,38 @@
+# ---- 凭证与个人配置（绝不提交）----
+config.json
+config.yaml
+cred.bin
+cred.dat
+*.cred
+.env
+
+# ---- 构建产物 ----
+bin/
+dist/
+build/
+auto-connect
+auto-connect.exe
+*.exe
+*.dll
+*.test
+
+# ---- 日志 ----
+*.log
+logs/
+
+# ---- 协议逆向原始文件（厂商版权文件，不入库）----
+tmp/
+
+# ---- 编辑器 / 系统 ----
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
+
+# ---- Python 缓存 ----
+__pycache__/
+*.pyc
+
+# ---- 本地工作记录（不进公开仓库）----
+.workbuddy/
