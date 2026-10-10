@@ -3,6 +3,7 @@
 package win
 
 import (
+	"os"
 	"os/exec"
 	"syscall"
 )
@@ -18,14 +19,21 @@ const (
 //
 // 用途：菜单里点「启动后台守护」时，守护进程必须能在菜单窗口被关闭后继续存活。
 // 普通的 exec.Command + Start 做不到这一点 —— 子进程会随父进程所在的控制台一起结束。
-func LaunchDetached(exe string, args ...string) error {
+//
+// logFile 非空时，子进程的标准输出与错误都会追加写入该文件。
+// 后台进程没有窗口，一旦启动失败，日志文件是唯一能看到线索的地方。
+func LaunchDetached(logFile, exe string, args ...string) error {
 	cmd := exec.Command(exe, args...)
 	cmd.SysProcAttr = &syscall.SysProcAttr{
 		HideWindow:    true,
 		CreationFlags: detachedProcess | createNewProcessGroup,
 	}
-	cmd.Stdin = nil
-	cmd.Stdout = nil
-	cmd.Stderr = nil
+	if logFile != "" {
+		if f, err := os.OpenFile(logFile, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600); err == nil {
+			cmd.Stdout = f
+			cmd.Stderr = f
+			defer f.Close() // 句柄已被子进程继承，父进程这份可以关掉
+		}
+	}
 	return cmd.Start()
 }

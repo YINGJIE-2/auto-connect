@@ -7,7 +7,6 @@
 package win
 
 import (
-	"bufio"
 	"errors"
 	"fmt"
 	"os"
@@ -111,21 +110,32 @@ func Decrypt(cipher []byte) ([]byte, error) {
 
 // SingleInstance 用命名互斥体保证同一时间只有一个守护进程。
 // 返回的 release 必须在退出时调用。
+//
+// 命名空间用 Local\（当前登录会话）而不是 Global\：我们只需要「本会话内唯一」，
+// 而 Local\ 不涉及任何特权要求，普通用户一定可用。
 func SingleInstance(name string) (release func(), ok bool, err error) {
-	namePtr, err := syscall.UTF16PtrFromString(`Global\` + name)
+	namePtr, err := syscall.UTF16PtrFromString(`Local\` + name)
 	if err != nil {
 		return nil, false, err
 	}
+
 	h, _, callErr := procCreateMutexW.Call(0, 0, uintptr(unsafe.Pointer(namePtr)))
 	if h == 0 {
 		return nil, false, fmt.Errorf("创建互斥体失败: %w", callErr)
 	}
-	// CreateMutexW 在对象已存在时返回有效句柄，但 GetLastError 为 ERROR_ALREADY_EXISTS
-	lastErr, _, _ := kernel32.NewProc("GetLastError").Call()
-	if lastErr == errorAlreadyExists {
+
+	// ⚠️ 这里【必须】用 Call 返回的 callErr，绝不能自己再调一次 GetLastError。
+	//
+	// 原因：Go 的 syscall 机制会在 CreateMutexW 返回的**那一刻**就去读 GetLastError
+	// 并作为第三个返回值交给我们。而 kernel32.NewProc("GetLastError") 再 Call 一次，
+	// 中间要经过 LoadLibrary / GetProcAddress 这些 API，它们会把错误码冲掉 ——
+	// 结果就是 ERROR_ALREADY_EXISTS 永远读不到，单实例保护形同虚设，
+	// 能同时跑起好几个守护进程，菜单也永远显示「未运行」。（实测踩过这个坑）
+	if errno, isErrno := callErr.(syscall.Errno); isErrno && errno == errorAlreadyExists {
 		syscall.CloseHandle(syscall.Handle(h))
 		return func() {}, false, nil
 	}
+
 	release = func() {
 		syscall.CloseHandle(syscall.Handle(h))
 	}
@@ -140,23 +150,48 @@ func ReadPassword() (string, error) {
 	var mode uint32
 	r, _, _ := procGetConsoleMode.Call(uintptr(handle), uintptr(unsafe.Pointer(&mode)))
 	if r == 0 {
-		return readLine()
+		return ReadLine()
 	}
 	// 关闭回显
 	procSetConsoleMode.Call(uintptr(handle), uintptr(mode&^enableEchoInput))
 	defer procSetConsoleMode.Call(uintptr(handle), uintptr(mode))
 
-	s, err := readLine()
+	s, err := ReadLine()
 	fmt.Println()
 	return s, err
 }
 
-func readLine() (string, error) {
-	line, err := bufio.NewReader(os.Stdin).ReadString('\n')
-	if err != nil && line == "" {
-		return "", err
+// ReadLine 从标准输入读一行（不含行尾换行）。
+//
+// ⚠️ 刻意**不使用 bufio.Reader**：bufio 会一次性预读一大块数据，
+// 而本程序里读密码（ReadPassword）需要单独从同一个 stdin 逐字节取。
+// 两个缓冲器混用会互相吞掉对方的数据，表现为「明明输入了却没反应」。
+// 更严重的是，若每次读一行都新建一个 bufio.Reader，前一个 Reader 预读进
+// 缓冲区的后续内容会随它被丢弃而永久丢失 —— 菜单曾因此读不到输入而无限刷屏。
+//
+// 逐字节读虽然慢，但人类输入的速度完全无感，而且绝不会出错。
+func ReadLine() (string, error) {
+	var sb strings.Builder
+	var b [1]byte
+	for {
+		n, err := os.Stdin.Read(b[:])
+		if n > 0 {
+			switch b[0] {
+			case '\n':
+				return sb.String(), nil
+			case '\r':
+				// 忽略 CR，只认 LF
+			default:
+				sb.WriteByte(b[0])
+			}
+		}
+		if err != nil {
+			if sb.Len() == 0 {
+				return "", err
+			}
+			return sb.String(), nil
+		}
 	}
-	return strings.TrimRight(line, "\r\n"), nil
 }
 
 // HideConsole 让当前进程脱离控制台，从而不显示窗口。

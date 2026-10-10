@@ -14,7 +14,6 @@
 package main
 
 import (
-	"bufio"
 	"context"
 	"flag"
 	"fmt"
@@ -169,7 +168,13 @@ func cmdMenu() error {
 			fmt.Println("  提示：目前没有任何守护在跑。选 3 启动后台守护，选 5 让它开机自动来。")
 		}
 
-		choice := strings.TrimSpace(readLineInput("\n请选择"))
+		choice, ok := readLineInput("\n请选择")
+		if !ok {
+			// 输入结束（Ctrl+Z 或管道读完）。必须退出，
+			// 否则会读不到任何输入而无限刷屏。
+			fmt.Println("再见。")
+			return nil
+		}
 		switch choice {
 		case "1":
 			menuReconnect(cfg)
@@ -252,18 +257,33 @@ func menuStartDaemon() {
 	// 清掉可能残留的停止标记，否则新守护会立刻自杀
 	_ = os.Remove(stopFlagPath())
 
-	if err := win.LaunchDetached(exe, "daemon", "--hidden"); err != nil {
+	if err := win.LaunchDetached(logPathOrEmpty(), exe, "daemon", "--hidden"); err != nil {
 		fmt.Println("\n启动失败：" + err.Error())
 		return
 	}
 
-	// 给它 1 秒起来，然后确认一下，避免「看起来成功其实没起来」
-	time.Sleep(time.Second)
-	if !daemonRunning() {
-		fmt.Println("\n启动似乎没有成功，请稍后重试，或改用菜单外的命令行：auto-connect daemon")
+	// 轮询确认，别只睡 1 秒就下结论 ——
+	// 首次启动要过杀毒软件扫描，慢的时候好几秒才真正跑起来。
+	fmt.Print("\n已发出启动指令，正在确认")
+	up := false
+	for i := 0; i < 20; i++ { // 最多等 10 秒
+		time.Sleep(500 * time.Millisecond)
+		if daemonRunning() {
+			up = true
+			break
+		}
+		fmt.Print(".")
+	}
+	fmt.Println()
+
+	if !up {
+		fmt.Println("\n后台守护没能启动起来。可以这样排查：")
+		fmt.Println("  · 先看日志有没有线索：" + logPathOrEmpty())
+		fmt.Println("  · 杀毒软件可能拦了后台进程，把本程序加入白名单后再试")
+		fmt.Println("  · 先选 1) 试一次立即认证，确认核心功能是好的")
 		return
 	}
-	fmt.Println("\n已启动后台守护：掉线会自动重连，关掉本窗口也不受影响。")
+	fmt.Println("启动成功：掉线会自动重连，关掉本窗口也不受影响。")
 	fmt.Println("日志文件：" + logPathOrEmpty())
 }
 
@@ -385,13 +405,15 @@ func stopFlagPath() string {
 	return filepath.Join(dir, "stop.flag")
 }
 
-func readLineInput(label string) string {
+// readLineInput 读一行输入。ok=false 表示输入已结束（EOF）。
+func readLineInput(label string) (val string, ok bool) {
 	fmt.Print(label + " > ")
-	line, err := bufio.NewReader(os.Stdin).ReadString('\n')
+	line, err := win.ReadLine()
 	if err != nil && line == "" {
-		return ""
+		fmt.Println()
+		return "", false
 	}
-	return strings.TrimSpace(line)
+	return strings.TrimSpace(line), true
 }
 
 func boolText(b bool, yes, no string) string {
@@ -545,8 +567,10 @@ func prompt(label, def string) string {
 	} else {
 		fmt.Printf("%s: ", label)
 	}
-	var line string
-	fmt.Scanln(&line)
+	line, err := win.ReadLine()
+	if err != nil && line == "" {
+		return def
+	}
 	line = strings.TrimSpace(line)
 	if line == "" {
 		return def
