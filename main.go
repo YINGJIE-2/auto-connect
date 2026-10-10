@@ -20,6 +20,7 @@ import (
 	"io"
 	"log"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"strconv"
@@ -137,14 +138,14 @@ func cmdMenu() error {
 		if err != nil {
 			return fmt.Errorf("读取配置失败: %w", err)
 		}
-		running := daemonRunning()
+		running, stray := daemonStatus()
 		auto := autostart.Method()
 		autoOn := auto != ""
 
 		fmt.Println("\n===========================================================")
 		fmt.Printf("  账号     : %s（%s）\n", cfg.Account(), config.ISPName(cfg.ISP))
 		fmt.Printf("  当前状态 : %s\n", stateText(cfg))
-		fmt.Printf("  后台守护 : %s\n", boolText(running, "运行中", "未运行"))
+		fmt.Printf("  后台守护 : %s\n", daemonStateText(running, stray))
 		fmt.Printf("  开机自启 : %s\n", autostartText(auto))
 		fmt.Println("-----------------------------------------------------------")
 		fmt.Println("  1) 立即检测并重连")
@@ -158,6 +159,8 @@ func cmdMenu() error {
 
 		// 一句话告诉用户「现在到底还要不要做点什么」
 		switch {
+		case stray > 0:
+			fmt.Println("  提示：检测到不受管的残留进程，选 4) 停止后台守护 可一次清理干净。")
 		case running && autoOn:
 			fmt.Println("  提示：已全部就绪，以后开机不用管它。")
 		case running && !autoOn:
@@ -244,8 +247,19 @@ func menuReconnect(cfg *config.Config) {
 }
 
 func menuStartDaemon() {
-	if daemonRunning() {
+	running, stray := daemonStatus()
+	if running {
 		fmt.Println("\n后台守护已经在跑了，不用重复启动。")
+		return
+	}
+
+	// 互斥体只能看到「同一命名空间」的实例。如果机器上还残留着别的
+	// auto-connect 进程（比如命名空间不同的旧版本、或异常退不掉的残留），
+	// 互斥体是看不见的 —— 这里查一次进程列表兜底，免得越堆越多。
+	if stray > 0 {
+		fmt.Printf("\n发现 %d 个不受本程序管理的 auto-connect 残留进程。\n", stray)
+		fmt.Println("这通常是旧版本留下的。多个守护同时跑不会互相踢下线，但纯属浪费，")
+		fmt.Println("建议先选 4) 停止后台守护 清理干净，再重新启动。")
 		return
 	}
 
@@ -288,25 +302,92 @@ func menuStartDaemon() {
 }
 
 func menuStopDaemon() {
-	if !daemonRunning() {
+	running, stray := daemonStatus()
+
+	if !running && stray == 0 {
 		fmt.Println("\n后台守护当前没有在运行。")
 		return
 	}
-	if err := os.WriteFile(stopFlagPath(), []byte("stop"), 0o600); err != nil {
-		fmt.Println("\n发送停止指令失败：" + err.Error())
-		return
+
+	// 第一步：发停止指令，让支持它的守护优雅退出（不杀进程，避开权限问题）
+	if running {
+		if err := os.WriteFile(stopFlagPath(), []byte("stop"), 0o600); err != nil {
+			fmt.Println("\n发送停止指令失败：" + err.Error())
+			return
+		}
+		fmt.Print("\n已发送停止指令，正在等待它退出")
+		for i := 0; i < 16; i++ { // 最多等 8 秒
+			time.Sleep(500 * time.Millisecond)
+			if !daemonRunning() {
+				fmt.Print(" 已退出。\n")
+				break
+			}
+			fmt.Print(".")
+		}
+		fmt.Println()
 	}
-	fmt.Print("\n已发送停止指令，正在等待它退出 ...")
-	for i := 0; i < 20; i++ { // 最多等 10 秒
-		time.Sleep(500 * time.Millisecond)
-		if !daemonRunning() {
-			fmt.Println(" 已停止。")
+
+	// 第二步：查残留。旧版本不认 stop.flag（连互斥体命名空间都不同），
+	// 只能强制结束 —— 否则用户会遇到「显示已停止，进程却还在」的怪事。
+	if stray > 0 {
+		fmt.Printf("还有 %d 个进程没退出（通常是旧版本残留），正在强制结束 ...\n", stray)
+		out, err := forceKillOthers()
+		if err != nil {
+			fmt.Println("强制结束失败：" + err.Error())
+			if out != "" {
+				fmt.Println("  " + out)
+			}
+			fmt.Println("请打开任务管理器，手动结束所有 auto-connect.exe。")
+			return
+		}
+		time.Sleep(time.Second)
+		if left := countOtherProcesses(); left > 0 {
+			fmt.Printf("仍有 %d 个进程在运行，请用任务管理器结束。\n", left)
 			return
 		}
 	}
-	fmt.Println()
-	fmt.Println("它还在运行（可能正卡在联网探测的超时等待里）。再等几秒重试，")
-	fmt.Println("或打开任务管理器结束 auto-connect.exe。")
+	fmt.Println("\n已全部停止。")
+}
+
+// countOtherProcesses 统计「除自己之外」还有几个 auto-connect 进程在跑。
+//
+// 为什么不只靠互斥体：命名互斥体只在同一命名空间内可见。
+// 如果存在旧版本残留（命名空间不同）或异常退不掉的进程，互斥体是看不见的，
+// 菜单就会误报「未运行」，导致守护进程悄悄越堆越多。查一次进程列表兜住这种情况。
+func countOtherProcesses() int {
+	out, err := exec.Command("tasklist",
+		"/FI", "IMAGENAME eq auto-connect.exe",
+		"/NH", "/FO", "CSV").Output()
+	if err != nil {
+		return 0 // 查不到就当没有，不影响主流程
+	}
+	self := os.Getpid()
+	n := 0
+	for _, line := range strings.Split(win.DecodeANSI(out), "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, `"`) {
+			continue // 跳过「信息: 没有运行的任务…」这类提示行
+		}
+		// CSV 形如： "auto-connect.exe","25716","Console","1","13,136 K"
+		fields := strings.Split(line, `","`)
+		if len(fields) < 2 {
+			continue
+		}
+		pid, err := strconv.Atoi(strings.Trim(fields[1], `"`))
+		if err != nil || pid == self {
+			continue
+		}
+		n++
+	}
+	return n
+}
+
+// forceKillOthers 强制结束除自己以外的所有 auto-connect 进程。
+func forceKillOthers() (string, error) {
+	out, err := exec.Command("taskkill",
+		"/F", "/IM", "auto-connect.exe",
+		"/FI", fmt.Sprintf("PID ne %d", os.Getpid())).CombinedOutput()
+	return win.DecodeANSI(out), err
 }
 
 func menuToggleAutostart() {
@@ -328,6 +409,20 @@ func menuToggleAutostart() {
 		return
 	}
 	fmt.Println("\n" + autostartDesc(method))
+}
+
+// daemonStateText 生成菜单里「后台守护」那一行的文字。
+// stray 是不受本程序管理的残留进程数（旧版本、异常退不掉等）。
+func daemonStateText(running bool, stray int) string {
+	switch {
+	case running && stray > 0:
+		return fmt.Sprintf("运行中（另有 %d 个残留进程）", stray)
+	case running:
+		return "运行中"
+	case stray > 0:
+		return fmt.Sprintf("无（但检出 %d 个残留进程）", stray)
+	}
+	return "未运行"
 }
 
 // autostartText 给菜单和 status 用的简短描述。
@@ -394,6 +489,22 @@ func daemonRunning() bool {
 	}
 	release()
 	return false
+}
+
+// daemonStatus 返回「受管的守护是否在运行」和「不受管的残留进程数」。
+//
+// 为什么两个都要：命名互斥体只在同一命名空间可见，跨命名空间（例如改过
+// 命名空间的老版本）或异常退不掉的进程它完全看不到。只靠互斥体会出现
+// 「菜单说未运行、其实已经有好几个在跑」的情况，所以必须再查一次进程列表。
+func daemonStatus() (running bool, stray int) {
+	running = daemonRunning()
+	stray = countOtherProcesses()
+	if running && stray > 0 {
+		// 抢到互斥体的那个守护本身也在进程列表里，把它减掉，
+		// 剩下的才是真正「不受管」的残留。
+		stray--
+	}
+	return running, stray
 }
 
 // stopFlagPath 返回停止标记文件路径。守护每轮探测都会看它一眼。
