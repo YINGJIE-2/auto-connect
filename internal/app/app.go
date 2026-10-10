@@ -125,27 +125,45 @@ func (a *App) LoginOnce(ctx context.Context, probe *netprobe.Result) (portal.Res
 	return adapter.Login(ctx, env)
 }
 
-// verifyOnline 登录成功后复检。
+// verifyOnline 认证后复检：确认网关真的放行了。
 //
-// 三个要点，都是实测踩出来的：
-//  1. **必须重试** —— 网关放行有 1~2 秒延迟，认证一返回成功就立刻探测会误报「未联网」。
-//  2. **每次探测必须用短超时**。用默认的 8 秒，一旦某个地址卡住就要白等 8 秒，
-//     日志上表现为「开始认证 → 认证成功」隔了 10~11 秒，用户会觉得连得很慢。
-//  3. **不要先 sleep 再探**。第一轮立刻探，赶上网关已经放行的情况就能秒返回；
-//     没赶上再退到 300ms 间隔重试，反正探测本身被短超时兜着，不会空转。
+// 设计取舍 —— 复检只是「确认」，绝不能反过来拖慢整件事。
 //
-// 另外 netprobe.Check 是并行探测的，单次耗时被封顶在 timeout，
-// 不会随探测地址数量线性增长（串行版本 3 个地址最坏要 3 x timeout）。
+// 实测（2026-10-10）：认证请求本身稳定在 **0.1 秒**，但复检出现过 **10.8 秒**
+// 才确认。日志拆分后看得一清二楚：`10.8 = 6 x (1.5 秒超时 + 0.3 秒间隔)`，
+// 也就是认证后连着 6 次探测全部卡到超时 —— 网关在切换会话状态的这段时间里
+// 根本不回应探测请求。
+//
+// 所以这里给一个**很短的硬预算**（budget），到点就放弃。认证请求已经明确
+// 返回了 result=1，那是比探测更可靠的信号；拿不到复检结论就当「已提交、
+// 等待放行」处理，交给主循环 5 秒后再看，而不是死等。
+//
+// 每次尝试都把「状态码 / 哪个源 / 耗时 / 失败原因」打出来 —— 只有这样才能
+// 区分「DNS 解析卡住」和「网关不放行」，别再靠猜。
 func (a *App) verifyOnline() bool {
-	deadline := time.Now().Add(15 * time.Second)
-	for time.Now().Before(deadline) {
-		if netprobe.Check(a.cfg.ProbeURLs, 1500*time.Millisecond).State == netprobe.Online {
+	const (
+		budget     = 4 * time.Second
+		perAttempt = 1200 * time.Millisecond
+		attemptGap = 200 * time.Millisecond
+	)
+	deadline := time.Now().Add(budget)
+	for attempt := 1; time.Now().Before(deadline); attempt++ {
+		start := time.Now()
+		r := netprobe.Check(a.cfg.ProbeURLs, perAttempt)
+		cost := time.Since(start).Seconds()
+
+		if r.State == netprobe.Online {
+			a.logger.Printf("  复检 #%d 通过：HTTP %d（%s）用时 %.1f 秒",
+				attempt, r.Code, probeHost(r.URL), cost)
 			return true
 		}
-		if time.Now().After(deadline) {
-			break
+		if r.State == netprobe.Unknown {
+			a.logger.Printf("  复检 #%d 不通：用时 %.1f 秒（%v）", attempt, cost, r.Err)
+		} else {
+			a.logger.Printf("  复检 #%d：%s HTTP %d（%s）用时 %.1f 秒",
+				attempt, r.State, r.Code, probeHost(r.URL), cost)
 		}
-		time.Sleep(300 * time.Millisecond)
+		time.Sleep(attemptGap)
 	}
 	return false
 }
@@ -192,17 +210,33 @@ func (a *App) Daemon(ctx context.Context) error {
 		case err != nil:
 			a.logger.Printf("认证异常（用时 %.1f 秒）：%v", loginCost.Seconds(), err)
 		case r.OK:
+			// 认证请求返回 result=1 的这一刻，网关就已经放行了 ——
+			// 这才是「网络恢复」的真实时刻，所以立刻打出来。
+			// 后面的复检只是确认，不能让它影响用户对快慢的判断。
+			a.logger.Printf("认证成功（用时 %.1f 秒），正在确认放行 ...", loginCost.Seconds())
+
 			t1 := time.Now()
-			if a.verifyOnline() {
-				a.logger.Printf("认证成功，网络已恢复（账号 %s，认证 %.1f 秒 + 复检 %.1f 秒）",
-					a.cfg.Account(), loginCost.Seconds(), time.Since(t1).Seconds())
-				failStreak = 0
-				if !sleepCtx(ctx, time.Duration(b.CheckInterval)*time.Second) {
-					return nil
-				}
-				continue
+			verified := a.verifyOnline()
+			verifyCost := time.Since(t1).Seconds()
+
+			if verified {
+				a.logger.Printf("网络已恢复（认证 %.1f 秒 + 确认 %.1f 秒）", loginCost.Seconds(), verifyCost)
+			} else {
+				a.logger.Printf("复检 %.1f 秒内没拿到确认（认证请求本身已成功），5 秒后再查", verifyCost)
 			}
-			a.logger.Printf("认证返回成功，但复检仍不通 —— 继续观察")
+
+			// 关键：**认证已返回 result=1 就不能走失败退避**。
+			// 否则网关放行慢几秒，重试间隔会被指数退避拉到 5 分钟，
+			// 用户真的要等很久。复检没确认时只等 5 秒就再看一眼。
+			failStreak = 0
+			next := time.Duration(b.CheckInterval) * time.Second
+			if !verified {
+				next = 5 * time.Second
+			}
+			if !sleepCtx(ctx, next) {
+				return nil
+			}
+			continue
 		default:
 			a.logger.Printf("认证失败：%s（原始响应 %s）", r.Message, truncate(r.Raw, 160))
 			if r.RetCode == 1 {
