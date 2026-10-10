@@ -15,10 +15,10 @@ auto-connect · Dr.COM(城市热点) Portal 认证 PoC
   python drcom_login.py --status
 
   # 2) 空跑：打印将要发出的完整请求，但不真的提交（推荐第一次这么用）
-  python drcom_login.py --user 2506249001 --password 你的密码 --isp telecom --dry-run
+  python drcom_login.py --user 2023001234 --password 你的密码 --isp telecom --dry-run
 
   # 3) 真实认证
-  python drcom_login.py --user 2506249001 --password 你的密码 --isp telecom
+  python drcom_login.py --user 2023001234 --password 你的密码 --isp telecom
 
   # 4) 指定运营商（不填默认 campus 校园内网）
   #    telecom=中国电信  cmcc=中国移动  unicom=中国联通  campus=校园内网
