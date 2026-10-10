@@ -105,13 +105,10 @@ func (a *App) LoginOnce(ctx context.Context, probe *netprobe.Result) (portal.Res
 		return portal.Result{}, err
 	}
 
-	// 抓一次认证页，用于识别厂商（失败也不影响，因为大概率就是 Dr.COM）
-	var portalBody []byte
-	if body, _, err := drcom.FetchRoot(ctx, host); err == nil {
-		portalBody = body
-	}
-
-	adapter := a.adapter(portalBody)
+	// 这里原本会先抓一次网关首页来「识别厂商」，但工程里目前只有 Dr.COM
+	// 一个适配器，adapter() 无论如何都会返回它 —— 那次 HTTP 往返纯属浪费
+	// （实测约 0.5 秒）。等以后接入第二家网关时，把 drcom.FetchRoot 加回来即可。
+	adapter := a.adapter(nil)
 	env := portal.Env{
 		Host:        host,
 		Port:        port,
@@ -128,11 +125,16 @@ func (a *App) LoginOnce(ctx context.Context, probe *netprobe.Result) (portal.Res
 }
 
 // verifyOnline 登录成功后复检。
-// 必须重试：网关放行有 1~2 秒延迟，立刻探测会误报「未联网」。
+//
+// 两个要点，都是实测踩出来的：
+//  1. **必须重试** —— 网关放行有 1~2 秒延迟，认证一返回成功就立刻探测会误报「未联网」。
+//  2. **每次探测必须用短超时**。用默认的 8 秒，网关放行期间第一个地址一旦卡住
+//     就要白等 8 秒，日志上表现为「开始认证 → 认证成功」隔了 10~11 秒，
+//     用户会觉得连得很慢。改成 1.5 秒后，正常情况下 2~3 秒就能确认。
 func (a *App) verifyOnline() bool {
-	for i := 0; i < 5; i++ {
-		time.Sleep(1500 * time.Millisecond)
-		if a.Check().State == netprobe.Online {
+	for i := 0; i < 8; i++ {
+		time.Sleep(800 * time.Millisecond)
+		if netprobe.Check(a.cfg.ProbeURLs, 1500*time.Millisecond).State == netprobe.Online {
 			return true
 		}
 	}
@@ -173,13 +175,15 @@ func (a *App) Daemon(ctx context.Context) error {
 			a.logger.Printf("检测到%s (HTTP %d)，开始认证 ...", res.State, res.Code)
 		}
 
+		t0 := time.Now()
 		r, err := a.LoginOnce(ctx, &res)
 		switch {
 		case err != nil:
-			a.logger.Printf("认证异常：%v", err)
+			a.logger.Printf("认证异常（用时 %.1f 秒）：%v", time.Since(t0).Seconds(), err)
 		case r.OK:
 			if a.verifyOnline() {
-				a.logger.Printf("认证成功，网络已恢复（账号 %s）", a.cfg.Account())
+				a.logger.Printf("认证成功，网络已恢复（账号 %s，全程 %.1f 秒）",
+					a.cfg.Account(), time.Since(t0).Seconds())
 				failStreak = 0
 				if !sleepCtx(ctx, time.Duration(b.CheckInterval)*time.Second) {
 					return nil
