@@ -13,6 +13,8 @@ import (
 	"os"
 	"strings"
 	"syscall"
+	"unicode/utf16"
+	"unicode/utf8"
 	"unsafe"
 )
 
@@ -20,13 +22,14 @@ var (
 	kernel32 = syscall.NewLazyDLL("kernel32.dll")
 	crypt32  = syscall.NewLazyDLL("crypt32.dll")
 
-	procLocalFree          = kernel32.NewProc("LocalFree")
-	procCreateMutexW       = kernel32.NewProc("CreateMutexW")
-	procFreeConsole        = kernel32.NewProc("FreeConsole")
-	procGetConsoleMode     = kernel32.NewProc("GetConsoleMode")
-	procSetConsoleMode     = kernel32.NewProc("SetConsoleMode")
-	procCryptProtectData   = crypt32.NewProc("CryptProtectData")
-	procCryptUnprotectData = crypt32.NewProc("CryptUnprotectData")
+	procLocalFree           = kernel32.NewProc("LocalFree")
+	procCreateMutexW        = kernel32.NewProc("CreateMutexW")
+	procFreeConsole         = kernel32.NewProc("FreeConsole")
+	procGetConsoleMode      = kernel32.NewProc("GetConsoleMode")
+	procSetConsoleMode      = kernel32.NewProc("SetConsoleMode")
+	procCryptProtectData    = crypt32.NewProc("CryptProtectData")
+	procCryptUnprotectData  = crypt32.NewProc("CryptUnprotectData")
+	procMultiByteToWideChar = kernel32.NewProc("MultiByteToWideChar")
 )
 
 // 这些字节作为「附加熵」参与密钥派生。
@@ -161,4 +164,39 @@ func readLine() (string, error) {
 // 如果控制台是终端自己开的，只是本进程脱离，那个窗口依然存在。
 func HideConsole() {
 	procFreeConsole.Call()
+}
+
+// CP_ACP：当前系统的 ANSI 代码页。中文 Windows 上就是 936（GBK）。
+const cpACP = 0
+
+// DecodeANSI 把命令行工具输出的 ANSI（中文系统上是 GBK）字节解码成 UTF-8。
+//
+// 为什么必须做这件事：schtasks、reg 这些工具的输出走系统 ANSI 代码页，
+// 直接按 UTF-8 处理会把每个汉字变成无效字节，最终显示成一串问号 ——
+// 错误信息就此丢失，用户只看到「exit status 1」和一堆 ????。
+func DecodeANSI(b []byte) string {
+	if len(b) == 0 {
+		return ""
+	}
+	// 已经是合法 UTF-8（例如输出全是 ASCII）就直接用，不做多余转换
+	if utf8.Valid(b) {
+		return string(b)
+	}
+
+	// 先问长度，再转换
+	n, _, _ := procMultiByteToWideChar.Call(
+		uintptr(cpACP), 0,
+		uintptr(unsafe.Pointer(&b[0])), uintptr(len(b)),
+		0, 0,
+	)
+	if n == 0 {
+		return strings.ToValidUTF8(string(b), "?")
+	}
+	buf := make([]uint16, n)
+	procMultiByteToWideChar.Call(
+		uintptr(cpACP), 0,
+		uintptr(unsafe.Pointer(&b[0])), uintptr(len(b)),
+		uintptr(unsafe.Pointer(&buf[0])), n,
+	)
+	return string(utf16.Decode(buf))
 }

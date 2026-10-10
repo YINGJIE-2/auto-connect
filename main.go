@@ -139,13 +139,14 @@ func cmdMenu() error {
 			return fmt.Errorf("读取配置失败: %w", err)
 		}
 		running := daemonRunning()
-		auto := autostart.IsInstalled()
+		auto := autostart.Method()
+		autoOn := auto != ""
 
 		fmt.Println("\n===========================================================")
 		fmt.Printf("  账号     : %s（%s）\n", cfg.Account(), config.ISPName(cfg.ISP))
 		fmt.Printf("  当前状态 : %s\n", stateText(cfg))
 		fmt.Printf("  后台守护 : %s\n", boolText(running, "运行中", "未运行"))
-		fmt.Printf("  开机自启 : %s\n", boolText(auto, "已开启", "未开启"))
+		fmt.Printf("  开机自启 : %s\n", autostartText(auto))
 		fmt.Println("-----------------------------------------------------------")
 		fmt.Println("  1) 立即检测并重连")
 		fmt.Println("  2) 修改配置（学号 / 密码 / 运营商）")
@@ -158,11 +159,11 @@ func cmdMenu() error {
 
 		// 一句话告诉用户「现在到底还要不要做点什么」
 		switch {
-		case running && auto:
+		case running && autoOn:
 			fmt.Println("  提示：已全部就绪，以后开机不用管它。")
-		case running && !auto:
+		case running && !autoOn:
 			fmt.Println("  提示：守护在跑，但没开开机自启。选 5 开启后，重启就不用手动来了。")
-		case !running && auto:
+		case !running && autoOn:
 			fmt.Println("  提示：开机自启已开，重启后会自动生效；想立刻生效就选 3。")
 		default:
 			fmt.Println("  提示：目前没有任何守护在跑。选 3 启动后台守护，选 5 让它开机自动来。")
@@ -289,7 +290,7 @@ func menuStopDaemon() {
 }
 
 func menuToggleAutostart() {
-	if autostart.IsInstalled() {
+	if method := autostart.Method(); method != "" {
 		if err := autostart.Uninstall(); err != nil {
 			fmt.Println("\n关闭开机自启失败：" + err.Error())
 			return
@@ -297,13 +298,43 @@ func menuToggleAutostart() {
 		fmt.Println("\n已关闭开机自启。以后开机需要自己双击本程序。")
 		return
 	}
-	if err := autostart.Install(""); err != nil {
-		fmt.Println("\n开启开机自启失败：" + err.Error())
-		fmt.Println("建议把程序放到固定的目录（例如 D:\\Tools\\auto-connect\\）再试一次，")
-		fmt.Println("放在桌面或下载文件夹里，路径变动后自启会失效。")
+
+	method, err := autostart.Install("")
+	if err != nil {
+		fmt.Println("\n开启开机自启失败：")
+		fmt.Println("      " + err.Error())
+		fmt.Println("\n建议先把程序挪到固定目录（例如 D:\\Tools\\auto-connect\\）再试一次；")
+		fmt.Println("放在桌面或下载文件夹里，重新下载后路径一变，自启就找不到程序了。")
 		return
 	}
-	fmt.Println("\n已开启开机自启：开机会延迟 30 秒、等网络就绪后自动联网，不弹窗口。")
+	fmt.Println("\n" + autostartDesc(method))
+}
+
+// autostartText 给菜单和 status 用的简短描述。
+func autostartText(method string) string {
+	switch method {
+	case autostart.MethodTask:
+		return "已开启（任务计划）"
+	case autostart.MethodStartup:
+		return "已开启（注册表启动项）"
+	}
+	return "未开启"
+}
+
+// methodDescShort 用于命令行 install 的简短反馈。
+func methodDescShort(method string) string {
+	if method == autostart.MethodStartup {
+		return "注册表启动项方式"
+	}
+	return "任务计划方式"
+}
+
+// autostartDesc 用于向导/菜单成功后的完整说明。
+func autostartDesc(method string) string {
+	if method == autostart.MethodStartup {
+		return "已开启开机自启（注册表启动项方式）：开机后会自动等网络就绪再联网，不弹窗口。"
+	}
+	return "已开启开机自启（任务计划方式）：开机延迟 30 秒、等网络就绪后自动联网，不弹窗口。"
 }
 
 func menuShowLog() {
@@ -490,10 +521,11 @@ func cmdSetup(args []string) error {
 
 	// 开机自启
 	fmt.Println("\n[3/3] 注册开机自启 ...")
-	if err := autostart.Install(""); err != nil {
-		fmt.Println("      注册失败（可稍后手动执行 auto-connect install）：" + err.Error())
+	if method, err := autostart.Install(""); err != nil {
+		fmt.Println("      注册没成功（可以在菜单里选 5) 重试）：")
+		fmt.Println("      " + err.Error())
 	} else {
-		fmt.Println("      已注册。开机会自动启动，且不弹窗口。")
+		fmt.Println("      " + autostartDesc(method))
 	}
 
 	fmt.Println("\n-----------------------------------------------------------")
@@ -599,6 +631,7 @@ func loadCredential() (string, error) {
 func cmdDaemon(args []string) error {
 	fs := flag.NewFlagSet("daemon", flag.ExitOnError)
 	hidden := fs.Bool("hidden", false, "隐藏控制台窗口（被任务计划程序拉起时使用）")
+	delay := fs.Int("delay", 0, "启动前最多等待多少秒让网络就绪（注册表自启方式使用）")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -654,7 +687,46 @@ func cmdDaemon(args []string) error {
 	}()
 
 	a := app.New(cfg, pw, newLogger(!*hidden))
+
+	// 注册表启动项方式没有「延迟启动」能力，改由程序自己等：
+	// 开机时程序往往比网卡先起来，直接探测会一律失败。
+	// 这里每 2 秒问一次内核「有没有默认路由」，网卡一就绪就立刻开工，
+	// 比死等固定秒数体验好得多。
+	if *delay > 0 {
+		waitForNetwork(ctx, *delay, !*hidden)
+	}
+
 	return a.Daemon(ctx)
+}
+
+// waitForNetwork 最多等 maxSeconds 秒，直到本机有可用的默认路由。
+func waitForNetwork(ctx context.Context, maxSeconds int, verbose bool) {
+	deadline := time.Now().Add(time.Duration(maxSeconds) * time.Second)
+	for time.Now().Before(deadline) {
+		if netprobe.LocalIPTowards("223.5.5.5", 80) != "" {
+			if verbose {
+				fmt.Println("网络已就绪，开始守护。")
+			}
+			return
+		}
+		if !sleepFor(ctx, 2*time.Second) {
+			return
+		}
+	}
+	if verbose {
+		fmt.Println("等待网络超时，仍按原计划开始守护（后续会自动重试）。")
+	}
+}
+
+func sleepFor(ctx context.Context, d time.Duration) bool {
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-t.C:
+		return true
+	}
 }
 
 // ---------------------------------------------------------------- 单次命令
@@ -679,7 +751,7 @@ func cmdStatus() error {
 	fmt.Printf("  账号     : %s\n", cfg.Account())
 	fmt.Printf("  运营商   : %s\n", config.ISPName(cfg.ISP))
 	fmt.Printf("  网关     : %s:%d\n", orDefault(cfg.Portal.Host, "(自动探测)"), cfg.Portal.Port)
-	fmt.Printf("  开机自启 : %s\n", yesNo(autostart.IsInstalled()))
+	fmt.Printf("  开机自启 : %s\n", autostartText(autostart.Method()))
 	fmt.Println()
 	return nil
 }
@@ -712,10 +784,11 @@ func cmdLogin() error {
 }
 
 func cmdInstall() error {
-	if err := autostart.Install(""); err != nil {
+	method, err := autostart.Install("")
+	if err != nil {
 		return err
 	}
-	fmt.Println("已注册开机自启（任务名：" + autostart.TaskName + "）")
+	fmt.Println("已注册开机自启：" + methodDescShort(method))
 	return nil
 }
 
